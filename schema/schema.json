@@ -1,0 +1,64 @@
+{
+    "type": "object",
+    "properties": {
+        "s3": {
+            "type": "object",
+            "properties": {
+                "role": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$",
+                            "minLength": 1,
+                            "maxLength": 32
+                        },
+                        "assume_role_policy": {
+                            "type": "string"
+                        }
+                    },
+                    "required": [
+                        "name"
+                    ],
+                    "additionalProperties": false
+                },
+                "buckets": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$",
+                                "minLength": 1,
+                                "maxLength": 63
+                            },
+                            "scope": {
+                                "type": "string",
+                                "enum": [
+                                    "public",
+                                    "private"
+                                ]
+                            }
+                        },
+                        "required": [
+                            "name",
+                            "scope"
+                        ],
+                        "additionalProperties": false
+                    }
+                }
+            },
+            "required": [
+                "role",
+                "buckets"
+            ],
+            "additionalProperties": false
+        }
+    },
+    "required": [
+        "s3"
+    ],
+    "additionalProperties": false
+}

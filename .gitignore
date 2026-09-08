@@ -1,0 +1,25 @@
+# Terraform state, plans, and CLI artifacts — never commit these.
+*.tfstate
+*.tfstate.*
+*.tfplan
+plan_output.txt
+crash.log
+crash.*.log
+
+# Local Terraform data (providers, modules cache). Lock files ARE committed.
+.terraform/
+.terraform.tfstate.lock.info
+
+# Override files are local-only by definition; *.tfvars may hold secrets.
+*override.tf
+*override.tf.json
+*_override.tf
+*_override.tf.json
+*.tfvars
+*.tfvars.json
+
+# Editors and OS noise
+.idea/
+.vscode/
+*.swp
+.DS_Store

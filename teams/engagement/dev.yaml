@@ -1,0 +1,11 @@
+# yaml-language-server: $schema=../../schema/schema.json
+s3:
+  role:
+    name: app
+  buckets:
+    - name: invoice-service
+      scope: private
+    - name: notification-service
+      scope: public
+    - name: search-service
+      scope: public

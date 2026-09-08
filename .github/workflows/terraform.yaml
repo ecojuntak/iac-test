@@ -1,0 +1,356 @@
+name: Terraform
+
+on:
+  pull_request:
+    paths:
+      - "teams/**"
+      - "module/**"
+      - "stack/**"
+      - "schema/**"
+      - "scripts/**"
+      - ".github/workflows/terraform.yaml"
+  push:
+    branches:
+      - main
+    paths:
+      - "teams/**"
+      - "module/**"
+      - "stack/**"
+      - "schema/**"
+      - "scripts/**"
+      - ".github/workflows/terraform.yaml"
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  TF_VERSION: "1.9.5"
+  AWS_REGION: ${{ vars.AWS_REGION }}
+  TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+  TF_STATE_TABLE: ${{ vars.TF_STATE_TABLE }}
+  TF_IN_AUTOMATION: "true"
+
+jobs:
+  config-validation:
+    name: Validate team configs (schema + bucket name uniqueness)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install validators
+        run: pip install jsonschema pyyaml
+
+      - name: Validate team configs
+        run: python3 scripts/validate_team_configs.py
+
+  module-tests:
+    name: Module tests (terraform test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Test module/s3 (mock provider)
+        run: terraform -chdir=module/s3 init -backend=false -input=false && terraform -chdir=module/s3 test
+
+      - name: Test module/access/s3 (providerless)
+        run: terraform -chdir=module/access/s3 init -backend=false -input=false && terraform -chdir=module/access/s3 test
+
+      - name: Test module/iam (mock provider)
+        run: terraform -chdir=module/iam init -backend=false -input=false && terraform -chdir=module/iam test
+
+      - name: Test stack/iam composition (mock provider, real team configs)
+        run: terraform -chdir=stack/iam init -backend=false -input=false && terraform -chdir=stack/iam test
+
+  changes:
+    name: Detect affected team x env x component
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      destroy_matrix: ${{ steps.matrix.outputs.destroy_matrix }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Wildcard group keys (not per-file): new teams/*/ or stack/*/ dirs need
+      # no workflow change. Outputs are JSON arrays of changed file paths
+      # (dir_names stays off so team env files keep their <env>.yaml names).
+      - name: Get changed dirs
+        id: changed-files
+        uses: tj-actions/changed-files@9426d40962ed5378910ee2e21d5f8c6fcbf2dd96 # v47.0.6
+        with:
+          matrix: true
+          files_yaml: |
+            global:
+              - schema/**
+              - .github/workflows/terraform.yaml
+            module:
+              - module/**
+            stack:
+              - stack/**
+            team:
+              - teams/**
+            # Separately tracked: deleted env files feed the dedicated
+            # destroy job (see destroy_matrix below).
+            deleted_team:
+              - teams/**
+
+      # module/x -> component x for all teams x envs
+      # stack/y -> component y for all teams x envs
+      # teams/<team>/<env>.yaml -> all components of that (team, env)
+      # global -> full matrix
+      #
+      # Team paths are intersected with the live tree: env files that still
+      # exist are matched by name (only known envs count), so a renamed or
+      # newly added env is picked up automatically. A file that was DELETED
+      # is not in the live tree, so it cannot be planned against: those
+      # paths go to destroy_matrix and are handled by the dedicated destroy
+      # job, which restores the file from the pre-change commit and runs
+      # terraform destroy.
+      - name: Compute matrix
+        id: matrix
+        env:
+          GLOBAL: ${{ steps.changed-files.outputs.global_any_modified }}
+          MODULE_DIRS: ${{ steps.changed-files.outputs.module_all_modified_files }}
+          STACK_DIRS: ${{ steps.changed-files.outputs.stack_all_modified_files }}
+          TEAM_FILES: ${{ steps.changed-files.outputs.team_all_modified_files }}
+          DELETED_TEAM_FILES: ${{ steps.changed-files.outputs.deleted_team_deleted_files }}
+        run: |
+          set -euo pipefail
+
+          envs="$(find teams/*/ -maxdepth 1 -name '*.yaml' -exec basename {} .yaml \; \
+            | grep -E '^[a-z0-9-]+$' | sort -u \
+            | jq -Rsc 'split("\n") | map(select(length > 0))')"
+
+          # Base cells: global change -> full matrix; otherwise map module/
+          # stack dirs to components and team files to their (team, env).
+          # Deleted teams/<team>/<env>.yaml paths become destroy cells for
+          # the dedicated destroy job instead.
+          base="$(jq -nc \
+            --arg global "${GLOBAL:-false}" \
+            --argjson module "${MODULE_DIRS:-[]}" \
+            --argjson stack "${STACK_DIRS:-[]}" \
+            --argjson team_files "${TEAM_FILES:-[]}" \
+            --argjson teams "$(ls -d teams/*/ | sed 's|teams/||; s|/||' | sort -u | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+            --argjson envs "${envs}" \
+            --argjson components "$(ls -d stack/*/ | sed 's|stack/||; s|/||' | sort -u | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+            '
+            def cross($t; $e; $c): [$t[] as $team | $e[] as $env | $c[] as $comp | {team: $team, environment: $env, component: $comp}];
+            if $global == "true" then cross($teams; $envs; $components)
+            else
+              ([$module[] | split("/")[1]] + [$stack[] | split("/")[1]]
+               | unique | map(select(. as $c | $components | index($c)))) as $cc
+              | ([ $team_files[]
+                  | select(startswith("teams/") and endswith(".yaml") and (split("/") | length) == 3)
+                  | (split("/")[1]) as $t
+                  | (split("/")[2] | sub("\\.yaml$"; "")) as $e
+                  | select($e as $env | $envs | index($env))
+                  | {team: $t, environment: $e} ]
+                  | unique) as $te
+              | ([ $te[] as $cell
+                   | $components[] as $comp
+                   | {team: $cell.team, environment: $cell.environment, component: $comp} ]
+                 + cross($teams; $envs; $cc)) | unique
+            end')"
+
+          # Destroy cells: one per deleted env file x every component. The
+          # env enum is fixed (the same list module/s3 and the stacks
+          # validate against); unknown/renamed env files are ignored.
+          destroy="$(jq -nc \
+            --argjson deleted_team_files "${DELETED_TEAM_FILES:-[]}" \
+            --argjson components "$(ls -d stack/*/ | sed 's|stack/||; s|/||' | sort -u | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+            '
+            [$deleted_team_files[]
+              | select(startswith("teams/") and endswith(".yaml") and (split("/") | length) == 3)
+              | (split("/")[1]) as $t
+              | (split("/")[2] | sub("\\.yaml$"; "")) as $e
+              | select($e as $env | ["dev", "staging", "prod"] | index($env))
+              | $components[] as $comp
+              | {team: $t, environment: $e, component: $comp}]
+            | unique')"
+
+          matrix="${base}"
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+          echo "destroy_matrix=${destroy}" >> "$GITHUB_OUTPUT"
+          echo "Matrix: ${matrix}"
+          echo "Destroy matrix: ${destroy}"
+
+  terraform:
+    name: tf ${{ matrix.team }} / ${{ matrix.environment }} / ${{ matrix.component }} (${{ github.event_name == 'pull_request' && 'plan' || 'apply' }})
+    needs: [changes, module-tests, config-validation]
+    if: ${{ needs.changes.outputs.matrix != '[]' }}
+    runs-on: ubuntu-latest
+    # Gated deployment environment for protected envs (e.g. prod reviewers);
+    # create matching GitHub Environments for any env listed here.
+    environment: ${{ contains(fromJSON('["prod"]'), matrix.environment) && matrix.environment || '' }}
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include: ${{ fromJSON(needs.changes.outputs.matrix) }}
+    env:
+      TEAM: ${{ matrix.team }}
+      ENVIRONMENT: ${{ matrix.environment }}
+      COMPONENT: ${{ matrix.component }}
+      TF_DIR: stack/${{ matrix.component }}
+      BACKEND_ARGS: >-
+        -backend-config="bucket=${{ vars[format('TF_STATE_BUCKET_{0}', matrix.environment)] || vars.TF_STATE_BUCKET }}"
+        -backend-config="key=${{ matrix.team }}/${{ matrix.environment }}/${{ matrix.component }}.tfstate"
+        -backend-config="region=${{ vars[format('AWS_REGION_{0}', matrix.environment)] || vars.AWS_REGION }}"
+        -backend-config="dynamodb_table=${{ vars[format('TF_STATE_TABLE_{0}', matrix.environment)] || vars.TF_STATE_TABLE }}"
+      PLAN_FILE: tfplan-${{ matrix.team }}-${{ matrix.environment }}-${{ matrix.component }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets[format('AWS_ROLE_TO_ASSUME_{0}_{1}', matrix.team, matrix.environment)] || secrets[format('AWS_ROLE_TO_ASSUME_{0}', matrix.environment)] || secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ vars[format('AWS_REGION_{0}', matrix.environment)] || vars.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform init
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform init -input=false ${BACKEND_ARGS}
+
+      - name: Terraform fmt
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform fmt -check -recursive
+
+      - name: Terraform plan (PR)
+        if: ${{ github.event_name == 'pull_request' }}
+        id: plan
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          set -o pipefail
+          terraform plan \
+            -input=false \
+            -var="team=${TEAM}" \
+            -var="environment=${ENVIRONMENT}" \
+            -out="${PLAN_FILE}" \
+            -no-color 2>&1 | tee plan_output.txt
+        continue-on-error: true
+
+      - name: Fail if plan failed
+        if: ${{ github.event_name == 'pull_request' && steps.plan.outcome == 'failure' }}
+        run: |
+          echo "::error::terraform plan failed for team ${TEAM} / ${ENVIRONMENT} / ${COMPONENT}"
+          exit 1
+
+      - name: Terraform plan (pre-apply)
+        if: ${{ github.event_name == 'push' }}
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          set -o pipefail
+          terraform plan \
+            -input=false \
+            -var="team=${TEAM}" \
+            -var="environment=${ENVIRONMENT}" \
+            -out="${PLAN_FILE}" \
+            -no-color
+
+      - name: Terraform apply
+        if: ${{ github.event_name == 'push' }}
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform apply -input=false -auto-approve "${PLAN_FILE}"
+
+      - name: Cleanup plan files
+        if: ${{ always() }}
+        working-directory: ${{ env.TF_DIR }}
+        run: rm -f "${PLAN_FILE}" plan_output.txt
+
+  # A deleted teams/<team>/<env>.yaml means that (team, env) cell is gone.
+  # Terraform cannot plan against a missing config, so this job restores the
+  # file from the commit BEFORE the change, runs terraform destroy, then
+  # verifies the config no longer exists — a delete/re-add race fails loudly
+  # instead of destroying based on stale assumptions. On PRs it only plans
+  # (destruction happens on merge), gated by the same per-env mechanism as
+  # applies.
+  destroy:
+    name: tf destroy ${{ matrix.team }} / ${{ matrix.environment }} / ${{ matrix.component }}
+    needs: [changes, module-tests, config-validation]
+    if: ${{ needs.changes.outputs.destroy_matrix != '[]' }}
+    runs-on: ubuntu-latest
+    environment: ${{ contains(fromJSON('["prod"]'), matrix.environment) && matrix.environment || '' }}
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include: ${{ fromJSON(needs.changes.outputs.destroy_matrix) }}
+    env:
+      TEAM: ${{ matrix.team }}
+      ENVIRONMENT: ${{ matrix.environment }}
+      COMPONENT: ${{ matrix.component }}
+      TF_DIR: stack/${{ matrix.component }}
+      BACKEND_ARGS: >-
+        -backend-config="bucket=${{ vars[format('TF_STATE_BUCKET_{0}', matrix.environment)] || vars.TF_STATE_BUCKET }}"
+        -backend-config="key=${{ matrix.team }}/${{ matrix.environment }}/${{ matrix.component }}.tfstate"
+        -backend-config="region=${{ vars[format('AWS_REGION_{0}', matrix.environment)] || vars.AWS_REGION }}"
+        -backend-config="dynamodb_table=${{ vars[format('TF_STATE_TABLE_{0}', matrix.environment)] || vars.TF_STATE_TABLE }}"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The commit before this change: the deleted file still exists here.
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+
+      - name: Verify deleted config exists only in history
+        run: |
+          file="teams/${TEAM}/${ENVIRONMENT}.yaml"
+          if [ -f "${file}" ]; then
+            echo "::error::teams/${TEAM}/${ENVIRONMENT}.yaml exists in the checked-out commit — not a deletion. Refusing to destroy."
+            exit 1
+          fi
+          echo "Confirmed ${file} is deleted in this change; proceeding with destroy."
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets[format('AWS_ROLE_TO_ASSUME_{0}_{1}', matrix.team, matrix.environment)] || secrets[format('AWS_ROLE_TO_ASSUME_{0}', matrix.environment)] || secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ vars[format('AWS_REGION_{0}', matrix.environment)] || vars.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Terraform init
+        working-directory: ${{ env.TF_DIR }}
+        run: terraform init -input=false ${BACKEND_ARGS}
+
+      # PR: show what WOULD be destroyed, don't touch anything.
+      - name: Terraform plan (destroy, PR preview)
+        if: ${{ github.event_name == 'pull_request' }}
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          set -o pipefail
+          terraform plan \
+            -input=false \
+            -destroy \
+            -var="team=${TEAM}" \
+            -var="environment=${ENVIRONMENT}" \
+            -no-color
+
+      # Merge: destroy for real.
+      - name: Terraform destroy
+        if: ${{ github.event_name == 'push' }}
+        working-directory: ${{ env.TF_DIR }}
+        run: |
+          set -o pipefail
+          terraform destroy \
+            -input=false \
+            -auto-approve \
+            -var="team=${TEAM}" \
+            -var="environment=${ENVIRONMENT}" \
+            -no-color
